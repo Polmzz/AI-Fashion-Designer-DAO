@@ -13,6 +13,10 @@
 (define-constant err-invalid-royalty-split (err u111))
 (define-constant err-max-remix-depth (err u112))
 (define-constant err-self-remix (err u113))
+(define-constant err-design-not-transferable (err u114))
+(define-constant err-transfer-not-found (err u115))
+(define-constant err-transfer-expired (err u116))
+(define-constant err-self-transfer (err u117))
 
 (define-data-var design-counter uint u0)
 (define-data-var collection-counter uint u0)
@@ -23,6 +27,8 @@
 (define-data-var remix-royalty-percentage uint u1500)
 (define-data-var max-remix-depth uint u3)
 (define-data-var remix-min-stake uint u500000)
+(define-data-var transfer-offer-counter uint u0)
+(define-data-var transfer-offer-duration uint u144)
 
 (define-map designs
   uint
@@ -124,6 +130,29 @@
 (define-map creator-remix-earnings
   {creator: principal, design-id: uint}
   {total-earned: uint, remixes-created: uint}
+)
+
+(define-map transfer-offers
+  uint
+  {
+    design-id: uint,
+    seller: principal,
+    buyer: (optional principal),
+    price: uint,
+    created-at: uint,
+    expires-at: uint,
+    status: (string-ascii 16)
+  }
+)
+
+(define-map design-transfer-history
+  uint
+  {
+    previous-owner: principal,
+    new-owner: principal,
+    transfer-price: uint,
+    transferred-at: uint
+  }
 )
 
 (define-public (submit-design (title (string-ascii 64)) (description (string-ascii 256)) (metadata-uri (string-ascii 512)))
@@ -753,6 +782,120 @@
     design (and 
              (is-eq (get status design) "winner")
              (get remixable design))
+    false
+  )
+)
+
+(define-public (create-transfer-offer (design-id uint) (price uint) (buyer (optional principal)))
+  (let (
+    (design (unwrap! (map-get? designs design-id) err-not-found))
+    (offer-id (+ (var-get transfer-offer-counter) u1))
+    (current-height (unwrap-panic (get-stacks-block-info? time burn-block-height)))
+  )
+    (asserts! (is-eq (get creator design) tx-sender) err-unauthorized)
+    (asserts! (is-eq (get status design) "winner") err-design-not-transferable)
+    (asserts! (> price u0) err-invalid-input)
+    (match buyer
+      specific-buyer (asserts! (not (is-eq specific-buyer tx-sender)) err-self-transfer)
+      true
+    )
+    
+    (map-set transfer-offers offer-id {
+      design-id: design-id,
+      seller: tx-sender,
+      buyer: buyer,
+      price: price,
+      created-at: current-height,
+      expires-at: (+ current-height (var-get transfer-offer-duration)),
+      status: "active"
+    })
+    
+    (var-set transfer-offer-counter offer-id)
+    (ok offer-id)
+  )
+)
+
+(define-public (accept-transfer-offer (offer-id uint))
+  (let (
+    (offer (unwrap! (map-get? transfer-offers offer-id) err-transfer-not-found))
+    (design (unwrap! (map-get? designs (get design-id offer)) err-not-found))
+    (current-height (unwrap-panic (get-stacks-block-info? time burn-block-height)))
+  )
+    (asserts! (is-eq (get status offer) "active") err-unauthorized)
+    (asserts! (<= current-height (get expires-at offer)) err-transfer-expired)
+    (asserts! (not (is-eq tx-sender (get seller offer))) err-self-transfer)
+    (match (get buyer offer)
+      specific-buyer (asserts! (is-eq tx-sender specific-buyer) err-unauthorized)
+      true
+    )
+    (asserts! (>= (stx-get-balance tx-sender) (get price offer)) err-insufficient-funds)
+    
+    (try! (stx-transfer? (get price offer) tx-sender (get seller offer)))
+    
+    (map-set designs (get design-id offer)
+      (merge design {creator: tx-sender})
+    )
+    
+    (map-set transfer-offers offer-id
+      (merge offer {status: "completed"})
+    )
+    
+    (map-set design-transfer-history (get design-id offer) {
+      previous-owner: (get seller offer),
+      new-owner: tx-sender,
+      transfer-price: (get price offer),
+      transferred-at: current-height
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-transfer-offer (offer-id uint))
+  (let (
+    (offer (unwrap! (map-get? transfer-offers offer-id) err-transfer-not-found))
+  )
+    (asserts! (is-eq (get seller offer) tx-sender) err-unauthorized)
+    (asserts! (is-eq (get status offer) "active") err-unauthorized)
+    
+    (map-set transfer-offers offer-id
+      (merge offer {status: "cancelled"})
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-transfer-offer-duration (new-duration uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> new-duration u0) err-invalid-input)
+    (var-set transfer-offer-duration new-duration)
+    (ok true)
+  )
+)
+
+(define-read-only (get-transfer-offer (offer-id uint))
+  (map-get? transfer-offers offer-id)
+)
+
+(define-read-only (get-design-transfer-history (design-id uint))
+  (map-get? design-transfer-history design-id)
+)
+
+(define-read-only (get-transfer-offer-counter)
+  (var-get transfer-offer-counter)
+)
+
+(define-read-only (get-transfer-offer-duration)
+  (var-get transfer-offer-duration)
+)
+
+(define-read-only (is-transfer-offer-active (offer-id uint))
+  (match (map-get? transfer-offers offer-id)
+    offer (and 
+            (is-eq (get status offer) "active")
+            (<= (unwrap-panic (get-stacks-block-info? time burn-block-height)) (get expires-at offer)))
     false
   )
 )
