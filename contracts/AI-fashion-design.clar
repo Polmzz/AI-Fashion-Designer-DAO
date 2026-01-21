@@ -17,6 +17,10 @@
 (define-constant err-transfer-not-found (err u115))
 (define-constant err-transfer-expired (err u116))
 (define-constant err-self-transfer (err u117))
+(define-constant err-already-collaborator (err u118))
+(define-constant err-max-collaborators (err u119))
+(define-constant err-invalid-share (err u120))
+(define-constant err-collab-not-found (err u121))
 
 (define-data-var design-counter uint u0)
 (define-data-var collection-counter uint u0)
@@ -29,6 +33,8 @@
 (define-data-var remix-min-stake uint u500000)
 (define-data-var transfer-offer-counter uint u0)
 (define-data-var transfer-offer-duration uint u144)
+(define-data-var collab-counter uint u0)
+(define-data-var max-collaborators uint u5)
 
 (define-map designs
   uint
@@ -153,6 +159,33 @@
     transfer-price: uint,
     transferred-at: uint
   }
+)
+
+(define-map collaborations
+  uint
+  {
+    design-id: uint,
+    lead-creator: principal,
+    collaborator-count: uint,
+    total-shares: uint,
+    created-at: uint,
+    finalized: bool
+  }
+)
+
+(define-map collaborators
+  {collab-id: uint, collaborator: principal}
+  {
+    share-percentage: uint,
+    role: (string-ascii 32),
+    joined-at: uint,
+    earnings-claimed: uint
+  }
+)
+
+(define-map design-collaborations
+  uint
+  uint
 )
 
 (define-public (submit-design (title (string-ascii 64)) (description (string-ascii 256)) (metadata-uri (string-ascii 512)))
@@ -898,4 +931,140 @@
             (<= (unwrap-panic (get-stacks-block-info? time burn-block-height)) (get expires-at offer)))
     false
   )
+)
+
+(define-public (create-collaboration (design-id uint) (initial-share uint))
+  (let (
+    (design (unwrap! (map-get? designs design-id) err-not-found))
+    (collab-id (+ (var-get collab-counter) u1))
+    (current-height (unwrap-panic (get-stacks-block-info? time burn-block-height)))
+  )
+    (asserts! (is-eq (get creator design) tx-sender) err-unauthorized)
+    (asserts! (is-eq (get status design) "active") err-voting-closed)
+    (asserts! (is-none (map-get? design-collaborations design-id)) err-already-collaborator)
+    (asserts! (and (> initial-share u0) (<= initial-share u10000)) err-invalid-share)
+    
+    (map-set collaborations collab-id {
+      design-id: design-id,
+      lead-creator: tx-sender,
+      collaborator-count: u1,
+      total-shares: initial-share,
+      created-at: current-height,
+      finalized: false
+    })
+    
+    (map-set collaborators {collab-id: collab-id, collaborator: tx-sender} {
+      share-percentage: initial-share,
+      role: "lead",
+      joined-at: current-height,
+      earnings-claimed: u0
+    })
+    
+    (map-set design-collaborations design-id collab-id)
+    (var-set collab-counter collab-id)
+    (ok collab-id)
+  )
+)
+
+(define-public (add-collaborator (collab-id uint) (collaborator principal) (share uint) (role (string-ascii 32)))
+  (let (
+    (collab (unwrap! (map-get? collaborations collab-id) err-collab-not-found))
+    (current-height (unwrap-panic (get-stacks-block-info? time burn-block-height)))
+    (new-total (+ (get total-shares collab) share))
+  )
+    (asserts! (is-eq (get lead-creator collab) tx-sender) err-unauthorized)
+    (asserts! (not (get finalized collab)) err-voting-closed)
+    (asserts! (< (get collaborator-count collab) (var-get max-collaborators)) err-max-collaborators)
+    (asserts! (is-none (map-get? collaborators {collab-id: collab-id, collaborator: collaborator})) err-already-collaborator)
+    (asserts! (not (is-eq collaborator tx-sender)) err-self-transfer)
+    (asserts! (and (> share u0) (<= new-total u10000)) err-invalid-share)
+    
+    (map-set collaborations collab-id
+      (merge collab {
+        collaborator-count: (+ (get collaborator-count collab) u1),
+        total-shares: new-total
+      })
+    )
+    
+    (map-set collaborators {collab-id: collab-id, collaborator: collaborator} {
+      share-percentage: share,
+      role: role,
+      joined-at: current-height,
+      earnings-claimed: u0
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (finalize-collaboration (collab-id uint))
+  (let (
+    (collab (unwrap! (map-get? collaborations collab-id) err-collab-not-found))
+  )
+    (asserts! (is-eq (get lead-creator collab) tx-sender) err-unauthorized)
+    (asserts! (not (get finalized collab)) err-voting-closed)
+    (asserts! (is-eq (get total-shares collab) u10000) err-invalid-share)
+    
+    (map-set collaborations collab-id
+      (merge collab {finalized: true})
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (claim-collaboration-earnings (collab-id uint) (payment-amount uint))
+  (let (
+    (collab (unwrap! (map-get? collaborations collab-id) err-collab-not-found))
+    (collaborator-data (unwrap! (map-get? collaborators {collab-id: collab-id, collaborator: tx-sender}) err-collab-not-found))
+    (design (unwrap! (map-get? designs (get design-id collab)) err-not-found))
+    (share-amount (/ (* payment-amount (get share-percentage collaborator-data)) u10000))
+  )
+    (asserts! (get finalized collab) err-voting-closed)
+    (asserts! (is-eq (get status design) "winner") err-not-winner)
+    (asserts! (> share-amount u0) err-invalid-input)
+    
+    (try! (as-contract (stx-transfer? share-amount tx-sender tx-sender)))
+    
+    (map-set collaborators {collab-id: collab-id, collaborator: tx-sender}
+      (merge collaborator-data {
+        earnings-claimed: (+ (get earnings-claimed collaborator-data) share-amount)
+      })
+    )
+    
+    (ok share-amount)
+  )
+)
+
+(define-public (update-max-collaborators (new-max uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (> new-max u1) (<= new-max u10)) err-invalid-input)
+    (var-set max-collaborators new-max)
+    (ok true)
+  )
+)
+
+(define-read-only (get-collaboration (collab-id uint))
+  (map-get? collaborations collab-id)
+)
+
+(define-read-only (get-collaborator (collab-id uint) (collaborator principal))
+  (map-get? collaborators {collab-id: collab-id, collaborator: collaborator})
+)
+
+(define-read-only (get-design-collaboration (design-id uint))
+  (map-get? design-collaborations design-id)
+)
+
+(define-read-only (get-collab-counter)
+  (var-get collab-counter)
+)
+
+(define-read-only (get-max-collaborators)
+  (var-get max-collaborators)
+)
+
+(define-read-only (is-collaborator (collab-id uint) (collaborator principal))
+  (is-some (map-get? collaborators {collab-id: collab-id, collaborator: collaborator}))
 )
